@@ -12,3 +12,5 @@ npm_install.log
 .DS_Store
 .npm_cache/
 npm-debug.log*
+test.txt
+test_server.js
