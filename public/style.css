@@ -1,0 +1,91 @@
+/* style.css */
+body {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+#chat-container {
+    scroll-behavior: smooth;
+}
+
+.typing-indicator {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+.typing-indicator span {
+    width: 6px;
+    height: 6px;
+    background-color: #9ca3af;
+    border-radius: 50%;
+    animation: typing 1s infinite;
+}
+.typing-indicator span:nth-child(2) { animation-delay: 0.2s; }
+.typing-indicator span:nth-child(3) { animation-delay: 0.4s; }
+
+@keyframes typing {
+    0%, 100% { transform: translateY(0); opacity: 0.5; }
+    50% { transform: translateY(-4px); opacity: 1; }
+}
+
+/* AI Message Content - Markdown Simple Styles */
+.ai-message-content p { margin-bottom: 0.75em; }
+.ai-message-content p:last-child { margin-bottom: 0; }
+.ai-message-content strong { font-weight: 600; color: #111827; }
+.ai-message-content ul { list-style-type: disc; padding-left: 1.5em; margin-bottom: 0.5em; }
+.ai-message-content ol { list-style-type: decimal; padding-left: 1.5em; margin-bottom: 0.5em; }
+.ai-message-content li { margin-bottom: 0.25em; }
+
+.mode-notice {
+    margin-bottom: 0.75rem;
+    padding: 0.5rem 0.75rem;
+    border-radius: 0.5rem;
+    font-size: 0.78rem;
+    font-weight: 600;
+    line-height: 1.35;
+}
+.mode-notice.is-api {
+    border: 1px solid #bfdbfe;
+    background-color: #eff6ff;
+    color: #1e40af;
+}
+.mode-notice.is-fallback {
+    border: 1px solid #fde68a;
+    background-color: #fffbeb;
+    color: #92400e;
+}
+
+/* Source Chip */
+.source-chip {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.25rem 0.6rem;
+    background-color: #eff6ff; /* blue-50 */
+    border: 1px solid #bfdbfe; /* blue-200 */
+    border-radius: 9999px;
+    font-size: 0.75rem;
+    color: #1e3a8a; /* blue-900 */
+    font-weight: 500;
+    margin-top: 0.75rem;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+.source-chip:hover {
+    background-color: #dbeafe; /* blue-100 */
+}
+
+/* Custom Scrollbar */
+::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+}
+::-webkit-scrollbar-track {
+    background: transparent;
+}
+::-webkit-scrollbar-thumb {
+    background: #cbd5e1;
+    border-radius: 10px;
+}
+::-webkit-scrollbar-thumb:hover {
+    background: #94a3b8;
+}

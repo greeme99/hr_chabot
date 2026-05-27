@@ -1,0 +1,23 @@
+{
+  "name": "local-knowledge-bot",
+  "version": "1.0.0",
+  "description": "Local-First RAG 지식봇 (Gemini 2.5 Flash + gemini-embedding-001)",
+  "main": "server-fast.js",
+  "scripts": {
+    "start": "node server-fast.js",
+    "start:full": "node server.js"
+  },
+  "dependencies": {
+    "@langchain/community": "^1.1.27",
+    "@langchain/core": "^1.1.39",
+    "@langchain/google-genai": "^2.1.27",
+    "@langchain/textsplitters": "^1.0.1",
+    "cors": "^2.8.6",
+    "dotenv": "^16.4.7",
+    "express": "^5.2.1",
+    "hnswlib-node": "^3.0.0",
+    "mammoth": "^1.12.0",
+    "pdf-parse": "^1.1.4",
+    "xlsx": "^0.18.5"
+  }
+}
