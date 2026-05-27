@@ -157,12 +157,15 @@ async function fetchSystemStatus() {
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || '상태 조회 실패');
 
-        const fallbackText = data.anythingLlm.configured ? '준비됨' : '설정 필요';
-        const fallbackClass = data.anythingLlm.configured ? 'text-green-700' : 'text-amber-700';
+        const chunksCount = data.chunkStore?.chunksCount ?? data.vectorStore?.chunksCount ?? 0;
+        const fallbackApi = data.fallbackApi || { provider: 'KIMI', configured: data.kimi?.configured };
+        const fallbackProvider = fallbackApi.provider || 'KIMI';
+        const fallbackText = fallbackApi.configured ? '준비됨' : '설정 필요';
+        const fallbackClass = fallbackApi.configured ? 'text-green-700' : 'text-amber-700';
         dom.systemStatus.innerHTML = `
-            <div class="flex justify-between gap-2"><span>인덱스 청크</span><strong>${data.vectorStore.chunksCount}</strong></div>
+            <div class="flex justify-between gap-2"><span>인덱스 청크</span><strong>${chunksCount}</strong></div>
             <div class="flex justify-between gap-2"><span>지원 문서</span><strong>${data.documents.supportedCount}</strong></div>
-            <div class="flex justify-between gap-2"><span>AnythingLLM</span><strong class="${fallbackClass}">${fallbackText}</strong></div>
+            <div class="flex justify-between gap-2"><span>${fallbackProvider}</span><strong class="${fallbackClass}">${fallbackText}</strong></div>
         `;
     } catch (error) {
         dom.systemStatus.innerHTML = `

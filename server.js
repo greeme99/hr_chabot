@@ -39,49 +39,44 @@ class Gemini25FlashChat {
     }
 }
 
-class AnythingLlmChat {
+class KimiChat {
     constructor(options = {}) {
-        this.baseUrl = (options.baseUrl || process.env.ANYTHINGLLM_API_BASE || 'http://127.0.0.1:3001').replace(/\/$/, '');
-        this.apiKey = options.apiKey || process.env.ANYTHINGLLM_API_KEY;
-        this.workspaceSlug = options.workspaceSlug || process.env.ANYTHINGLLM_WORKSPACE_SLUG;
-        this.mode = options.mode || process.env.ANYTHINGLLM_MODE || 'chat';
-        this.sessionId = options.sessionId || process.env.ANYTHINGLLM_SESSION_ID || 'local-knowledge-bot-fallback';
+        this.baseUrl = (options.baseUrl || process.env.KIMI_API_BASE || 'https://api.moonshot.ai/v1').replace(/\/$/, '');
+        this.apiKey = options.apiKey || process.env.KIMI_API_KEY;
+        this.modelName = options.model || process.env.KIMI_MODEL || 'moonshot-v1-8k';
+        this.temperature = Number(options.temperature ?? process.env.KIMI_TEMPERATURE ?? 0.2);
     }
 
     async invoke(messages) {
         if (!this.apiKey) {
-            throw new Error('ANYTHINGLLM_API_KEY가 설정되지 않았습니다.');
-        }
-        if (!this.workspaceSlug) {
-            throw new Error('ANYTHINGLLM_WORKSPACE_SLUG가 설정되지 않았습니다.');
+            throw new Error('KIMI_API_KEY가 설정되지 않았습니다.');
         }
 
         const prompt = messages.map(msg => msg.content).join('\n\n');
-        const response = await fetch(`${this.baseUrl}/api/v1/workspace/${encodeURIComponent(this.workspaceSlug)}/chat`, {
+        const response = await fetch(`${this.baseUrl}/chat/completions`, {
             method: 'POST',
             headers: {
                 Authorization: `Bearer ${this.apiKey}`,
                 'Content-Type': 'application/json'
             },
             body: JSON.stringify({
-                message: prompt,
-                mode: this.mode,
-                sessionId: this.sessionId,
-                enable_thinking: false
+                model: this.modelName,
+                messages: [{ role: 'user', content: prompt }],
+                temperature: this.temperature
             })
         });
 
         if (!response.ok) {
             const errorText = await response.text();
-            throw new Error(`AnythingLLM 응답 생성 실패: ${response.status} ${response.statusText} ${errorText}`);
+            throw new Error(`KIMI 응답 생성 실패: ${response.status} ${response.statusText} ${errorText}`);
         }
 
         const data = await response.json();
-        const text = data?.textResponse || data?.response || data?.text || data?.message;
+        const text = data?.choices?.[0]?.message?.content || data?.text || data?.response;
         if (!text) {
-            throw new Error('AnythingLLM 응답 본문이 비어 있습니다.');
+            throw new Error('KIMI 응답 본문이 비어 있습니다.');
         }
-        return { content: text, provider: 'anythingllm', model: this.workspaceSlug };
+        return { content: text, provider: 'kimi', model: this.modelName };
     }
 }
 
@@ -462,7 +457,7 @@ async function loadDocument(filePath, file) {
 
 async function generateAnswerWithFallback(fullPrompt) {
     if (!process.env.GOOGLE_API_KEY || process.env.GOOGLE_API_KEY === 'your_api_key_here') {
-        console.warn('GOOGLE_API_KEY가 없어 Gemini 호출을 건너뛰고 AnythingLLM fallback을 시도합니다.');
+        console.warn('GOOGLE_API_KEY가 없어 Gemini 호출을 건너뛰고 KIMI fallback을 시도합니다.');
     } else {
         const gemini = new Gemini25FlashChat({
             apiKey: process.env.GOOGLE_API_KEY,
@@ -473,16 +468,16 @@ async function generateAnswerWithFallback(fullPrompt) {
         try {
             return await gemini.invoke([{ _getType: () => "human", content: fullPrompt }]);
         } catch (error) {
-            console.warn(`Gemini 응답 생성 실패, AnythingLLM fallback 시도: ${error.message}`);
+            console.warn(`Gemini 응답 생성 실패, KIMI fallback 시도: ${error.message}`);
         }
     }
 
-    const anythingLlm = new AnythingLlmChat();
+    const kimi = new KimiChat();
     try {
-        return await anythingLlm.invoke([{ _getType: () => "human", content: fullPrompt }]);
+        return await kimi.invoke([{ _getType: () => "human", content: fullPrompt }]);
     } catch (error) {
-        console.error(`AnythingLLM fallback 실패: ${error.message}`);
-        throw new Error('Gemini API 실패 후 AnythingLLM fallback도 실패했습니다. ANYTHINGLLM_API_BASE, ANYTHINGLLM_API_KEY, ANYTHINGLLM_WORKSPACE_SLUG, AnythingLLM 서버 상태를 확인해주세요.');
+        console.error(`KIMI fallback 실패: ${error.message}`);
+        throw new Error('Gemini API 실패 후 KIMI fallback도 실패했습니다. KIMI_API_BASE, KIMI_API_KEY, KIMI_MODEL 설정을 확인해주세요.');
     }
 }
 
@@ -561,13 +556,11 @@ app.get('/api/status', (req, res) => {
         const documentFiles = fs.existsSync(DOCUMENTS_DIR)
             ? fs.readdirSync(DOCUMENTS_DIR).filter(isSupportedDocument)
             : [];
-        const anythingLlm = {
-            apiBase: process.env.ANYTHINGLLM_API_BASE || 'http://127.0.0.1:3001',
-            apiKeyState: getEnvState(process.env.ANYTHINGLLM_API_KEY),
-            workspaceSlugState: getEnvState(process.env.ANYTHINGLLM_WORKSPACE_SLUG),
-            mode: process.env.ANYTHINGLLM_MODE || 'chat',
-            configured: getEnvState(process.env.ANYTHINGLLM_API_KEY) === 'set'
-                && getEnvState(process.env.ANYTHINGLLM_WORKSPACE_SLUG) === 'set'
+        const kimi = {
+            apiBase: process.env.KIMI_API_BASE || 'https://api.moonshot.ai/v1',
+            apiKeyState: getEnvState(process.env.KIMI_API_KEY),
+            model: process.env.KIMI_MODEL || 'moonshot-v1-8k',
+            configured: getEnvState(process.env.KIMI_API_KEY) === 'set'
         };
 
         res.json({
@@ -584,7 +577,8 @@ app.get('/api/status', (req, res) => {
                 model: process.env.GEMINI_CHAT_MODEL || 'gemini-2.5-flash',
                 apiVersion: process.env.GEMINI_API_VERSION || 'v1'
             },
-            anythingLlm
+            kimi,
+            fallbackApi: { provider: 'KIMI', configured: kimi.configured }
         });
     } catch (error) {
         res.status(500).json({ error: error.message });

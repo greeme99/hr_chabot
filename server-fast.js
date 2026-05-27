@@ -29,6 +29,13 @@ function sendJson(res, statusCode, payload) {
     res.end(JSON.stringify(payload));
 }
 
+function getEnvState(value) {
+    if (value === undefined) return 'missing';
+    if (value === '') return 'empty';
+    if (/your_|_here|api_key|발급받은/i.test(value)) return 'placeholder';
+    return 'set';
+}
+
 function readJsonBody(req) {
     return new Promise((resolve, reject) => {
         let body = '';
@@ -51,6 +58,43 @@ function readJsonBody(req) {
     });
 }
 
+async function generateKimiAnswer(prompt) {
+    const apiKey = process.env.KIMI_API_KEY;
+    const apiBase = (process.env.KIMI_API_BASE || 'https://api.moonshot.ai/v1').replace(/\/$/, '');
+    const model = process.env.KIMI_MODEL || 'moonshot-v1-8k';
+    const temperature = Number(process.env.KIMI_TEMPERATURE || 0.2);
+
+    if (getEnvState(apiKey) !== 'set') {
+        throw new Error('KIMI_API_KEY가 설정되지 않았습니다.');
+    }
+
+    const response = await fetch(`${apiBase}/chat/completions`, {
+        method: 'POST',
+        headers: {
+            Authorization: `Bearer ${apiKey}`,
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+            model,
+            messages: [{ role: 'user', content: prompt }],
+            temperature
+        })
+    });
+
+    if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`KIMI 응답 생성 실패: ${response.status} ${response.statusText} ${errorText}`);
+    }
+
+    const data = await response.json();
+    const content = data?.choices?.[0]?.message?.content || data?.text || data?.response;
+    if (!content) {
+        throw new Error('KIMI 응답 본문이 비어 있습니다.');
+    }
+
+    return { content, provider: 'kimi', model };
+}
+
 function loadChunks() {
     if (!fs.existsSync(chunksPath)) return [];
     try {
@@ -59,6 +103,153 @@ function loadChunks() {
         console.warn('chunks.json 로드 실패:', error.message);
         return [];
     }
+}
+
+function cleanExtractedText(text, ext) {
+    let cleaned = String(text || '')
+        .replace(/\u0000/g, ' ')
+        .replace(/data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+/g, ' ');
+
+    if (['.md', '.markdown'].includes(ext)) {
+        cleaned = cleaned
+            .replace(/<img\b[^>]*>/gi, ' ')
+            .replace(/<[^>]+>/g, ' ')
+            .replace(/!\[[^\]]*]\([^)]*\)/g, ' ');
+    }
+
+    return cleaned
+        .replace(/[ \t]+\n/g, '\n')
+        .replace(/\n{4,}/g, '\n\n\n')
+        .trim();
+}
+
+async function loadDocument(filePath, file) {
+    const ext = path.extname(file).toLowerCase();
+
+    if (ext === '.pdf') {
+        const pdf = require('pdf-parse');
+        const data = await pdf(fs.readFileSync(filePath));
+        return [{
+            pageContent: cleanExtractedText(data.text, ext),
+            metadata: { source: file, type: 'pdf', pages: data.numpages }
+        }];
+    }
+
+    if (ext === '.docx') {
+        const mammoth = require('mammoth');
+        const result = await mammoth.extractRawText({ path: filePath });
+        return [{
+            pageContent: cleanExtractedText(result.value, ext),
+            metadata: { source: file, type: 'docx' }
+        }];
+    }
+
+    if (['.xlsx', '.xls', '.csv', '.tsv'].includes(ext)) {
+        const XLSX = require('xlsx');
+        const workbook = XLSX.readFile(filePath, { cellDates: true });
+        return workbook.SheetNames.map(sheetName => {
+            const sheet = workbook.Sheets[sheetName];
+            const text = XLSX.utils.sheet_to_csv(sheet, { FS: '\t', blankrows: false });
+            return {
+                pageContent: cleanExtractedText(text, ext),
+                metadata: { source: file, type: ext.slice(1), sheet: sheetName }
+            };
+        });
+    }
+
+    if (['.txt', '.md', '.markdown'].includes(ext)) {
+        return [{
+            pageContent: cleanExtractedText(fs.readFileSync(filePath, 'utf8'), ext),
+            metadata: { source: file, type: ext.slice(1) }
+        }];
+    }
+
+    return [];
+}
+
+function splitTextIntoChunks(text, metadata, chunkSize = 1000, chunkOverlap = 200) {
+    const normalized = String(text || '').replace(/\s+/g, ' ').trim();
+    if (!normalized) return [];
+
+    const chunks = [];
+    let start = 0;
+    while (start < normalized.length) {
+        let end = Math.min(start + chunkSize, normalized.length);
+        if (end < normalized.length) {
+            const breakPoint = Math.max(
+                normalized.lastIndexOf('. ', end),
+                normalized.lastIndexOf('? ', end),
+                normalized.lastIndexOf('! ', end),
+                normalized.lastIndexOf('다. ', end),
+                normalized.lastIndexOf('요. ', end),
+                normalized.lastIndexOf(' ', end)
+            );
+            if (breakPoint > start + Math.floor(chunkSize * 0.55)) {
+                end = breakPoint + 1;
+            }
+        }
+
+        const pageContent = normalized.slice(start, end).trim();
+        if (pageContent.length > 0) {
+            chunks.push({
+                pageContent,
+                metadata: {
+                    ...metadata,
+                    chunk: chunks.length + 1
+                }
+            });
+        }
+
+        if (end >= normalized.length) break;
+        start = Math.max(0, end - chunkOverlap);
+    }
+
+    return chunks;
+}
+
+async function ingestDocuments() {
+    if (!fs.existsSync(storageDir)) fs.mkdirSync(storageDir, { recursive: true });
+
+    const files = listDocumentFiles();
+    const allChunks = [];
+    const fileStats = {};
+    const skippedFiles = [];
+
+    for (const file of files) {
+        const filePath = path.join(documentsDir, file);
+        const docs = await loadDocument(filePath, file);
+        const readableDocs = docs.filter(doc => doc.pageContent && doc.pageContent.trim().length > 0);
+        const chunks = readableDocs.flatMap(doc => splitTextIntoChunks(doc.pageContent, doc.metadata));
+
+        fileStats[file] = {
+            sections: docs.length,
+            readableSections: readableDocs.length,
+            extractedChars: readableDocs.reduce((sum, doc) => sum + doc.pageContent.trim().length, 0),
+            chunks: chunks.length
+        };
+
+        if (chunks.length === 0) {
+            skippedFiles.push(file);
+            continue;
+        }
+
+        allChunks.push(...chunks);
+    }
+
+    const payload = allChunks.map((doc, index) => ({
+        id: index,
+        pageContent: doc.pageContent,
+        metadata: doc.metadata || {}
+    }));
+    fs.writeFileSync(chunksPath, JSON.stringify(payload, null, 2), 'utf8');
+
+    return {
+        message: `총 ${files.length}개 파일을 ${payload.length}개 청크로 지식DB에 저장했습니다.`,
+        documentsCount: files.length,
+        chunksCount: payload.length,
+        skippedFiles,
+        fileStats
+    };
 }
 
 function sourceStats(chunks) {
@@ -140,6 +331,46 @@ function buildExtractiveAnswer(docs) {
     };
 }
 
+function buildRagPrompt(question, docs) {
+    const context = docs.map(doc => doc.pageContent).join('\n\n');
+    return `
+당신은 회사의 규정, 지침, 지식을 제공하는 챗봇입니다.
+유일한 정보원은 아래 [문서청크 저장소]입니다.
+청크 저장소에 명시된 내용만 사용해 답변하고, 추측이나 일반 상식으로 보충하지 마세요.
+관련 정보를 찾지 못한 경우 정확히 "${knowledgeNotFoundMessage}"라고 답하세요.
+답변 마지막에는 인용 문서를 "참고: 문서명1, 문서명2" 형식으로 표시하세요.
+
+[문서청크 저장소]
+${context}
+
+[사용자 질문]
+${question}
+`.trim();
+}
+
+function normalizeKimiAnswer(answer, sources) {
+    const text = String(answer || '').trim();
+    if (text.includes(knowledgeNotFoundMessage)) {
+        return { answer: knowledgeNotFoundMessage, sources: [] };
+    }
+
+    const uniqueSources = [...new Set(sources)].filter(Boolean);
+    if (uniqueSources.length === 0) {
+        return { answer: text, sources: [] };
+    }
+
+    const body = text
+        .split('\n')
+        .filter(line => !line.trim().startsWith('참고:'))
+        .join('\n')
+        .trim();
+
+    return {
+        answer: `${body}\n\n참고: ${uniqueSources.join(', ')}`,
+        sources: uniqueSources
+    };
+}
+
 function listDocumentFiles() {
     if (!fs.existsSync(documentsDir)) return [];
     return fs.readdirSync(documentsDir).filter(file => supportedExtensions.has(path.extname(file).toLowerCase()));
@@ -194,12 +425,15 @@ const server = http.createServer(async (req, res) => {
                     model: process.env.GEMINI_CHAT_MODEL || 'gemini-2.5-flash',
                     apiVersion: process.env.GEMINI_API_VERSION || 'v1'
                 },
-                anythingLlm: {
-                    apiBase: process.env.ANYTHINGLLM_API_BASE || 'http://127.0.0.1:3001',
-                    apiKeyState: process.env.ANYTHINGLLM_API_KEY ? 'set' : 'missing',
-                    workspaceSlugState: process.env.ANYTHINGLLM_WORKSPACE_SLUG ? 'set' : 'missing',
-                    mode: process.env.ANYTHINGLLM_MODE || 'chat',
-                    configured: Boolean(process.env.ANYTHINGLLM_API_KEY && process.env.ANYTHINGLLM_WORKSPACE_SLUG)
+                kimi: {
+                    apiBase: process.env.KIMI_API_BASE || 'https://api.moonshot.ai/v1',
+                    apiKeyState: getEnvState(process.env.KIMI_API_KEY),
+                    model: process.env.KIMI_MODEL || 'moonshot-v1-8k',
+                    configured: getEnvState(process.env.KIMI_API_KEY) === 'set'
+                },
+                fallbackApi: {
+                    provider: 'KIMI',
+                    configured: getEnvState(process.env.KIMI_API_KEY) === 'set'
                 }
             });
         }
@@ -226,20 +460,47 @@ const server = http.createServer(async (req, res) => {
             const { question } = await readJsonBody(req);
             if (typeof question !== 'string' || !question.trim()) return sendJson(res, 400, { error: '질문을 입력해주세요.' });
             const docs = keywordSearch(question.trim(), 6);
+            if (docs.length === 0) {
+                return sendJson(res, 200, {
+                    answer: knowledgeNotFoundMessage,
+                    sources: [],
+                    provider: 'local-extractive',
+                    model: 'keyword-search',
+                    fallback: { used: true, from: 'kimi', to: 'web-local-rag', reason: 'no-retrieved-chunks' },
+                    notice: fallbackNotice
+                });
+            }
+
+            const sources = [...new Set(docs.map(doc => doc.metadata?.source || '문서'))];
+            try {
+                const kimiResponse = await generateKimiAnswer(buildRagPrompt(question.trim(), docs));
+                const normalized = normalizeKimiAnswer(kimiResponse.content, sources);
+                return sendJson(res, 200, {
+                    answer: normalized.answer,
+                    sources: normalized.sources,
+                    provider: kimiResponse.provider,
+                    model: kimiResponse.model,
+                    fallback: { used: false, from: null, to: null, reason: null },
+                    notice: apiNotice
+                });
+            } catch (error) {
+                console.warn(`KIMI API 실패, 웹 로직 fallback 전환: ${error.message}`);
+            }
+
             const result = buildExtractiveAnswer(docs);
-            const notFound = result.answer === knowledgeNotFoundMessage;
             return sendJson(res, 200, {
                 answer: result.answer,
-                sources: notFound ? [] : result.sources,
+                sources: result.sources,
                 provider: 'local-extractive',
                 model: 'keyword-search',
-                fallback: { used: true, from: 'api', to: 'web-local-rag', reason: notFound ? 'no-retrieved-chunks' : 'fast-local-server' },
-                notice: notFound ? fallbackNotice : fallbackNotice
+                fallback: { used: true, from: 'kimi', to: 'web-local-rag', reason: 'kimi-api-failed' },
+                notice: fallbackNotice
             });
         }
 
         if (req.method === 'POST' && pathname === '/api/ingest') {
-            return sendJson(res, 501, { error: '빠른 로컬 서버에서는 문서 재학습을 지원하지 않습니다. 기존 청크 저장소로 질의응답은 가능합니다.' });
+            const result = await ingestDocuments();
+            return sendJson(res, 200, result);
         }
 
         if (req.method === 'GET') return serveStatic(req, res, pathname);
