@@ -89,3 +89,52 @@ body {
 ::-webkit-scrollbar-thumb:hover {
     background: #94a3b8;
 }
+
+/* ── Provider Badge ─────────────────────────────── */
+.provider-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    padding: 0.22rem 0.65rem;
+    border-radius: 9999px;
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+    margin-bottom: 0.65rem;
+    border: 1px solid transparent;
+}
+
+/* Gemini — 보라/인디고 계열 */
+.badge-gemini {
+    background: linear-gradient(135deg, #ede9fe 0%, #e0e7ff 100%);
+    border-color: #c4b5fd;
+    color: #4c1d95;
+}
+
+/* Kimi (Moonshot) — 다크블루/슬레이트 계열 */
+.badge-kimi {
+    background: linear-gradient(135deg, #e0f2fe 0%, #dbeafe 100%);
+    border-color: #7dd3fc;
+    color: #0c4a6e;
+}
+
+/* 웹 로직 — 앰버/황색 계열 */
+.badge-web {
+    background: linear-gradient(135deg, #fefce8 0%, #fef3c7 100%);
+    border-color: #fcd34d;
+    color: #78350f;
+}
+
+/* fallback 태그 */
+.badge-fallback-tag {
+    display: inline-block;
+    margin-left: 0.35rem;
+    padding: 0.05rem 0.4rem;
+    background: rgba(0,0,0,0.08);
+    border-radius: 4px;
+    font-size: 0.65rem;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+}
+

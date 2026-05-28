@@ -271,7 +271,7 @@ function tokenize(text) {
         .filter(token => !queryStopwords.has(token));
 }
 
-function keywordSearch(question, limit = 6) {
+function keywordSearch(question, limit = 8) {
     const chunks = loadChunks();
     const queryTokens = tokenize(question);
     if (chunks.length === 0 || queryTokens.length === 0) return [];
@@ -286,14 +286,25 @@ function keywordSearch(question, limit = 6) {
         const source = String(chunk.metadata?.source || '').normalize('NFC').toLowerCase();
         let score = 0;
         let contentScore = 0;
+        let matchedTokenCount = 0;
 
         for (const token of queryTokens) {
             if (content.includes(token)) {
-                score += 8;
-                contentScore += 8;
+                // 토큰 빈도수에 비례한 가중치
+                const freq = (content.match(new RegExp(token, 'g')) || []).length;
+                const tokenScore = 8 + Math.min(freq - 1, 4) * 2;
+                score += tokenScore;
+                contentScore += tokenScore;
+                matchedTokenCount++;
             }
             if (source.includes(token)) score += 5;
         }
+
+        // 질문 키워드 중 절반 이상 매칭된 청크에 보너스
+        if (queryTokens.length > 0 && matchedTokenCount / queryTokens.length >= 0.5) {
+            score += 15;
+        }
+
         if (normalizedQuestion.includes('코칭') && source.includes('코칭')) score += 20;
         if (normalizedQuestion.includes('gps') && source.includes('gps')) score += 20;
         if (normalizedQuestion.includes('경쟁사') && source.includes('경쟁사')) score += 25;
@@ -302,9 +313,12 @@ function keywordSearch(question, limit = 6) {
         return { chunk, score, contentScore };
     });
 
-    const allPositive = scored.filter(item => item.score > 0).sort((a, b) => b.score - a.score);
-    const contentPositive = scored.filter(item => item.contentScore > 0).sort((a, b) => b.score - a.score);
+    // 최소 점수 임계값: 질문 키워드 2개 이상 실제 포함 청크만 허용
+    const MIN_SCORE = 16;
+    const allPositive = scored.filter(item => item.score >= MIN_SCORE).sort((a, b) => b.score - a.score);
+    const contentPositive = scored.filter(item => item.contentScore >= MIN_SCORE).sort((a, b) => b.score - a.score);
     const positive = contentPositive.length > 0 ? contentPositive : allPositive;
+
     const focused = preferredSourceHints.length > 0
         ? positive.filter(item => {
             const source = String(item.chunk.metadata?.source || '').normalize('NFC').toLowerCase();
@@ -318,34 +332,136 @@ function keywordSearch(question, limit = 6) {
     }));
 }
 
-function buildExtractiveAnswer(docs) {
-    if (docs.length === 0) return { answer: knowledgeNotFoundMessage, sources: [] };
-    const sources = [...new Set(docs.map(doc => doc.metadata?.source || '문서'))];
-    const snippets = docs.slice(0, 4).map((doc, index) => {
-        const text = String(doc.pageContent || '').replace(/\s+/g, ' ').trim().slice(0, 550);
-        return `${index + 1}. ${text}`;
+// 청크 내에서 질문 키워드가 포함된 문장만 추출
+function extractRelevantSentences(text, queryTokens, maxSentences = 5, contextWindow = 0) {
+    if (!text || queryTokens.length === 0) return '';
+
+    const raw = text.replace(/\s+/g, ' ').trim();
+
+    // PDF 청크 실제 형식: 마침표+공백 기준 분리
+    const sentences = raw.split(/\.\s+/).map(s => s.trim()).filter(s => s.length > 10);
+    if (sentences.length === 0) return '';
+
+    // 각 문장의 관련도 점수 계산
+    const sentenceScores = sentences.map((sent, idx) => {
+        const lower = sent.normalize('NFC').toLowerCase();
+        let score = 0;
+        for (const token of queryTokens) {
+            if (lower.includes(token)) score += 10;
+        }
+        return { sent, idx, score };
     });
+
+    // 점수 > 0 인 문장 중 상위 maxSentences개 선택 + contextWindow 확장
+    const relevant = new Set();
+    sentenceScores
+        .filter(item => item.score > 0)
+        .sort((a, b) => b.score - a.score)
+        .slice(0, maxSentences)
+        .forEach(item => {
+            for (let i = Math.max(0, item.idx - contextWindow); i <= Math.min(sentences.length - 1, item.idx + contextWindow); i++) {
+                relevant.add(i);
+            }
+        });
+
+    if (relevant.size === 0) return '';
+
+    return [...relevant].sort((a, b) => a - b).map(i => sentences[i]).join('. ');
+}
+
+
+function buildExtractiveAnswer(docs, question) {
+    if (docs.length === 0) return { answer: knowledgeNotFoundMessage, sources: [] };
+
+    const queryTokens = tokenize(question || '');
+
+    // 전역 문장 dedupe: overlap 청크에서 동일 문장 재출력 방지
+    const seenSentences = new Set();
+    const mergedBySource = {};
+
+    for (const doc of docs) {
+        const source = doc.metadata?.source || '문서';
+        const raw = doc.pageContent.replace(/\s+/g, ' ').trim();
+
+        // 마침표+공백 기준 문장 분리
+        const sentences = raw.split(/\.\s+/).map(s => s.trim()).filter(s => s.length > 10);
+
+        // 각 문장 점수 계산
+        const scored = sentences.map((sent, idx) => {
+            const lower = sent.normalize('NFC').toLowerCase();
+            let score = 0;
+            for (const token of queryTokens) {
+                if (lower.includes(token)) score += 10;
+            }
+            return { sent, idx, score };
+        });
+
+        // 상위 관련 문장 추출 (contextWindow=0: 정확히 매칭 문장만)
+        const selected = new Set();
+        scored
+            .filter(item => item.score > 0)
+            .sort((a, b) => b.score - a.score)
+            .slice(0, 5)
+            .forEach(item => selected.add(item.idx));
+
+        if (selected.size === 0) continue;
+
+        // 개별 문장 dedupe 후 수집
+        const uniqueSents = [];
+        for (const idx of [...selected].sort((a, b) => a - b)) {
+            const sent = sentences[idx];
+            const key = sent.replace(/\s+/g, '').slice(0, 80);
+            if (!seenSentences.has(key)) {
+                seenSentences.add(key);
+                uniqueSents.push(sent);
+            }
+        }
+
+        if (uniqueSents.length === 0) continue;
+        if (!mergedBySource[source]) mergedBySource[source] = [];
+        mergedBySource[source].push(uniqueSents.join('. '));
+    }
+
+    if (Object.keys(mergedBySource).length === 0) {
+        return { answer: knowledgeNotFoundMessage, sources: [] };
+    }
+
+    const answerParts = Object.entries(mergedBySource).map(([source, texts]) => {
+        return `**[${source}]**\n${texts.join('\n')}`;
+    });
+
+    const uniqueSources = Object.keys(mergedBySource);
+
     return {
-        answer: `${snippets.join('\n')}\n\n참고: ${sources.join(', ')}`,
-        sources
+        answer: `${answerParts.join('\n\n')}\n\n참고: ${uniqueSources.join(', ')}`,
+        sources: uniqueSources
     };
 }
 
 function buildRagPrompt(question, docs) {
-    const context = docs.map(doc => doc.pageContent).join('\n\n');
-    return `
-당신은 회사의 규정, 지침, 지식을 제공하는 챗봇입니다.
+    const context = docs.map((doc, i) => `[청크 ${i + 1}] (출처: ${doc.metadata?.source || '문서'})\n${doc.pageContent}`).join('\n\n');
+    return `당신은 회사의 규정, 지침, 지식을 제공하는 챗봇입니다.
+사용자가 지식DB 범위에 해당하는 질문을 하면, 문맥에 기반하여 답변하고 인용 문서를 알려주세요.
+
+[정보원 제한]
 유일한 정보원은 아래 [문서청크 저장소]입니다.
-청크 저장소에 명시된 내용만 사용해 답변하고, 추측이나 일반 상식으로 보충하지 마세요.
-관련 정보를 찾지 못한 경우 정확히 "${knowledgeNotFoundMessage}"라고 답하세요.
-답변 마지막에는 인용 문서를 "참고: 문서명1, 문서명2" 형식으로 표시하세요.
+
+[답변 원칙 - 반드시 준수]
+1. 청크 저장소에 명시된 내용만 사용해 답변합니다.
+2. 인용한 문서가 복수일 경우, 전부 표시합니다 (예: 참고: 문서A.pdf, 문서B.docx).
+3. 청크 저장소에 있는 내용은 찾아서 해당 내용만 답변합니다.
+4. "자세한 내용은 사내 관련 문서를 참고하시거나", "담당자에게 문의하시기 바랍니다" 등의 부연 문구는 절대 추가하지 않습니다.
+5. 문서에 근거가 없거나 지식DB와 직접 연결할 수 없는 내용은 절대 추측하거나 일반 상식으로 보충하지 않습니다.
+6. 관련 정보를 찾지 못한 경우, 정확히 다음과 같이만 답합니다: "${knowledgeNotFoundMessage}"
+7. 사용자의 주장·정보가 규정과 다를 경우, 다음 형식으로 답합니다: "문의하신 내용은 규정과 다릅니다. 지식DB에 따르면 (규정 내용 요약)"
+8. 규정의 표현을 왜곡하지 말고, 핵심 문장을 요약하여 설명하되 필요하면 원문도 함께 제시합니다.
+9. 규정에 없는 부가적인 조언(개인적 의견, 관행, 추정)은 절대 하지 않습니다.
 
 [문서청크 저장소]
 ${context}
 
 [사용자 질문]
-${question}
-`.trim();
+${question}`.trim();
 }
 
 function normalizeKimiAnswer(answer, sources) {
@@ -459,7 +575,7 @@ const server = http.createServer(async (req, res) => {
         if (req.method === 'POST' && pathname === '/api/ask') {
             const { question } = await readJsonBody(req);
             if (typeof question !== 'string' || !question.trim()) return sendJson(res, 400, { error: '질문을 입력해주세요.' });
-            const docs = keywordSearch(question.trim(), 6);
+            const docs = keywordSearch(question.trim(), 8);
             if (docs.length === 0) {
                 return sendJson(res, 200, {
                     answer: knowledgeNotFoundMessage,
@@ -487,7 +603,7 @@ const server = http.createServer(async (req, res) => {
                 console.warn(`KIMI API 실패, 웹 로직 fallback 전환: ${error.message}`);
             }
 
-            const result = buildExtractiveAnswer(docs);
+            const result = buildExtractiveAnswer(docs, question.trim());
             return sendJson(res, 200, {
                 answer: result.answer,
                 sources: result.sources,

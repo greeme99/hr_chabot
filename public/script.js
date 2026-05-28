@@ -14,9 +14,94 @@ const dom = {
 const API_BASE_URL = window.location.protocol === 'file:'
     ? 'http://127.0.0.1:3000'
     : '';
+const IS_STATIC_DEPLOY = window.location.hostname.endsWith('github.io');
+const KNOWLEDGE_NOT_FOUND_MESSAGE = '해당 내용은 지식DB에 없습니다';
+let staticChunksCache = null;
 
 function apiUrl(path) {
     return `${API_BASE_URL}${path}`;
+}
+
+async function loadStaticChunks() {
+    if (staticChunksCache) return staticChunksCache;
+    const res = await fetch('chunks.json', { cache: 'no-store' });
+    if (!res.ok) throw new Error('정적 지식DB를 불러오지 못했습니다.');
+    staticChunksCache = await res.json();
+    return staticChunksCache;
+}
+
+function tokenize(text) {
+    const stopwords = new Set(['내용', '내용은', '핵심', '요약', '정리', '설명', '설명해줘', '알려줘', '무엇', '무엇인가요', '뭔가요', '어떻게', '되나요', '인가요', '주세요']);
+    return String(text || '')
+        .normalize('NFC')
+        .toLowerCase()
+        .replace(/[^\p{L}\p{N}\s_.-]/gu, ' ')
+        .split(/\s+/)
+        .map(token => token.trim())
+        .filter(token => token.length >= 2)
+        .filter(token => !stopwords.has(token));
+}
+
+function searchStaticChunks(question, chunks, limit = 6) {
+    const queryTokens = tokenize(question);
+    if (queryTokens.length === 0) return [];
+
+    const scored = chunks.map(chunk => {
+        const content = String(chunk.pageContent || '').normalize('NFC').toLowerCase();
+        const source = String(chunk.metadata?.source || '').normalize('NFC').toLowerCase();
+        let score = 0;
+        let contentScore = 0;
+
+        for (const token of queryTokens) {
+            if (content.includes(token)) {
+                score += 8;
+                contentScore += 8;
+            }
+            if (source.includes(token)) score += 5;
+        }
+
+        return { chunk, score, contentScore };
+    });
+
+    const contentPositive = scored.filter(item => item.contentScore > 0).sort((a, b) => b.score - a.score);
+    const allPositive = scored.filter(item => item.score > 0).sort((a, b) => b.score - a.score);
+    return (contentPositive.length > 0 ? contentPositive : allPositive)
+        .slice(0, limit)
+        .map(item => ({
+            pageContent: item.chunk.pageContent,
+            metadata: { ...item.chunk.metadata, retrieval: 'static-keyword', score: item.score }
+        }));
+}
+
+function buildStaticAnswer(docs) {
+    if (docs.length === 0) {
+        return { answer: KNOWLEDGE_NOT_FOUND_MESSAGE, sources: [] };
+    }
+
+    const sources = [...new Set(docs.map(doc => doc.metadata?.source || '문서'))];
+    const snippets = docs.slice(0, 3).map((doc, index) => {
+        const text = String(doc.pageContent || '').replace(/\s+/g, ' ').trim().slice(0, 650);
+        return `${index + 1}. ${text}`;
+    });
+
+    return {
+        answer: `${snippets.join('\n')}\n\n참고: ${sources.join(', ')}`,
+        sources
+    };
+}
+
+async function askStatic(question) {
+    const chunks = await loadStaticChunks();
+    const docs = searchStaticChunks(question, chunks, 6);
+    const result = buildStaticAnswer(docs);
+    return {
+        answer: result.answer,
+        sources: result.sources,
+        provider: 'static-pages',
+        model: 'browser-keyword-search',
+        fallback: { used: true, from: 'server-api', to: 'github-pages-static-rag', reason: 'static-deploy' },
+        notice: 'GitHub Pages 정적 배포 환경에서 브라우저 지식DB 검색으로 답변했습니다.'
+    };
 }
 
 function showToast(message, type = 'info') {
@@ -53,7 +138,33 @@ function formatMarkdown(text) {
     return `<p>${formatted}</p>`;
 }
 
-function appendMessage(role, content, source = null, notice = null, noticeType = 'api') {
+function getProviderBadge(provider, model, fallback) {
+    if (!provider) return '';
+
+    let label, icon, colorClass;
+
+    if (provider === 'gemini') {
+        label = `Gemini · ${model || ''}`;
+        icon = '✦';
+        colorClass = 'badge-gemini';
+    } else if (provider === 'kimi') {
+        label = `Kimi · ${model || ''}`;
+        icon = '🌙';
+        colorClass = 'badge-kimi';
+    } else {
+        label = '웹 로직 (키워드 검색)';
+        icon = '🔍';
+        colorClass = 'badge-web';
+    }
+
+    const fallbackTag = fallback?.used
+        ? `<span class="badge-fallback-tag">fallback</span>`
+        : '';
+
+    return `<div class="provider-badge ${colorClass}">${icon} ${label}${fallbackTag}</div>`;
+}
+
+function appendMessage(role, content, source = null, notice = null, noticeType = 'api', provider = null, model = null, fallback = null) {
     const isUser = role === 'user';
     const wrapper = document.createElement('div');
     wrapper.className = `flex flex-col gap-1 w-full ${isUser ? 'items-end' : 'items-start'} max-w-3xl ${isUser ? 'ml-auto' : ''}`;
@@ -68,6 +179,14 @@ function appendMessage(role, content, source = null, notice = null, noticeType =
     if (isUser) {
         bubble.textContent = content; 
     } else {
+        // Provider 배지
+        const badgeHtml = getProviderBadge(provider, model, fallback);
+        if (badgeHtml) {
+            const badgeWrapper = document.createElement('div');
+            badgeWrapper.innerHTML = badgeHtml;
+            bubble.appendChild(badgeWrapper);
+        }
+
         if (notice && notice.trim() !== '') {
             const noticeDiv = document.createElement('div');
             noticeDiv.className = `mode-notice ${noticeType === 'fallback' ? 'is-fallback' : 'is-api'}`;
@@ -120,6 +239,28 @@ function removeTypingIndicator() {
 }
 
 async function fetchDocsList() {
+    if (IS_STATIC_DEPLOY) {
+        try {
+            const chunks = await loadStaticChunks();
+            const files = [...new Set(chunks.map(chunk => chunk.metadata?.source).filter(Boolean))];
+            dom.docList.innerHTML = '';
+            files.forEach(file => {
+                const li = document.createElement('li');
+                li.className = 'flex items-center gap-2 text-sm text-gray-700 py-2 px-2 hover:bg-gray-100 rounded-lg transition-colors cursor-default';
+                li.innerHTML = `
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 text-primary shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
+                    </svg>
+                    <span class="truncate">${file}</span>
+                `;
+                dom.docList.appendChild(li);
+            });
+        } catch (error) {
+            dom.docList.innerHTML = '<li class="text-sm text-red-500 py-2 px-2">정적 지식DB 로드 실패</li>';
+        }
+        return;
+    }
+
     try {
         const res = await fetch(apiUrl('/api/files'));
         const data = await res.json();
@@ -152,6 +293,21 @@ async function fetchDocsList() {
 
 async function fetchSystemStatus() {
     if (!dom.systemStatus) return;
+    if (IS_STATIC_DEPLOY) {
+        try {
+            const chunks = await loadStaticChunks();
+            const files = new Set(chunks.map(chunk => chunk.metadata?.source).filter(Boolean));
+            dom.systemStatus.innerHTML = `
+                <div class="flex justify-between gap-2"><span>인덱스 청크</span><strong>${chunks.length}</strong></div>
+                <div class="flex justify-between gap-2"><span>지원 문서</span><strong>${files.size}</strong></div>
+                <div class="flex justify-between gap-2"><span>GitHub Pages</span><strong class="text-green-700">정적 모드</strong></div>
+            `;
+        } catch (error) {
+            dom.systemStatus.innerHTML = '<div class="text-red-600 font-semibold">정적 지식DB 로드 실패</div>';
+        }
+        return;
+    }
+
     try {
         const res = await fetch(apiUrl('/api/status'));
         const data = await res.json();
@@ -176,6 +332,11 @@ async function fetchSystemStatus() {
 }
 
 async function ingestDocs() {
+    if (IS_STATIC_DEPLOY) {
+        showToast('GitHub Pages에서는 문서 재학습을 지원하지 않습니다. 로컬 서버에서 재학습 후 다시 배포해주세요.', 'info');
+        return;
+    }
+
     dom.loadingOverlay.classList.remove('hidden');
     dom.loadingOverlay.classList.add('flex');
     try {
@@ -207,13 +368,18 @@ async function sendMessage() {
     showTypingIndicator();
     
     try {
-        const res = await fetch(apiUrl('/api/ask'), {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ question: text })
-        });
-        
-        const data = await res.json();
+        let data;
+        let res = { ok: true };
+        if (IS_STATIC_DEPLOY) {
+            data = await askStatic(text);
+        } else {
+            res = await fetch(apiUrl('/api/ask'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ question: text })
+            });
+            data = await res.json();
+        }
         removeTypingIndicator();
         
         if (res.ok) {
@@ -243,7 +409,7 @@ async function sendMessage() {
             }
             answerText = answerLines.filter(line => !line.trim().startsWith('참고:')).join('\n').trim();
 
-            appendMessage('ai', answerText, source, data.notice, data.fallback?.used ? 'fallback' : 'api');
+            appendMessage('ai', answerText, source, data.notice, data.fallback?.used ? 'fallback' : 'api', data.provider, data.model, data.fallback);
         } else {
             appendMessage('ai', `오류가 발생했습니다: ${data.error}`);
         }
